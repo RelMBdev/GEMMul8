@@ -7,6 +7,7 @@ template <typename T>
 void check_accuracy(
     std::string &deviceName,
     std::string &dateTime,
+    size_t memory_limit,
     cublasFillMode_t uplo_A,
     cublasFillMode_t uplo_B,
     cublasOperation_t trans_A,
@@ -15,6 +16,6 @@ void check_accuracy(
     cublasDiagType_t diag_B,
     const bool run_Ozaki2_I8,
     const bool run_Ozaki2_F8,
-    const bool run_Ozaki1_I8);
+    const bool run_cuBLAS_FP64_emu);
 
 } // namespace bench::accuracy::trtrmm

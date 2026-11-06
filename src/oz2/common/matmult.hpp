@@ -1,10 +1,32 @@
 #pragma once
 #include "common.hpp"
+#include "fp8_plan.hpp"
+#include "../mod/mod_reduce_matprod_declaration.hpp"
 
 namespace gemmul8::common {
 
+// #if defined(CUBLAS_VER_MAJOR) && (CUBLAS_VER_MAJOR >= 13)
+// inline constexpr auto GEMMul8_GEMM_ALGO = CUBLAS_GEMM_AUTOTUNE;
+// #else
+inline constexpr auto GEMMul8_GEMM_ALGO = CUBLAS_GEMM_DEFAULT;
+// #endif
+
+#define GEMMul8_CUBLAS_GEMM(                           \
+    handle, transa, transb, m, n, k, alpha,            \
+    A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc, \
+    computeType, algo)                                 \
+    cublasGemmStridedBatchedEx(                        \
+        (handle), (transa), (transb), (m), (n), (k),   \
+        (alpha),                                       \
+        (A), (Atype), (lda), 0LL,                      \
+        (B), (Btype), (ldb), 0LL,                      \
+        (beta),                                        \
+        (C), (Ctype), (ldc), 0LL,                      \
+        1, (computeType), (algo))
+// #define GEMMul8_CUBLAS_GEMM cublasGemmEx
+
 template <Backend BACKEND>
-inline void call_gemm_tn(
+inline void call_gemm_tn_raw(
     const cudaStream_t stream, Handle_t &h,
     int m, int n, int k,
     const void *alpha,
@@ -18,27 +40,88 @@ inline void call_gemm_tn(
     constexpr auto COMP_TYPE   = (BACKEND == Backend::INT8) ? CUBLAS_COMPUTE_32I : CUBLAS_COMPUTE_32F;
 
     if (h.kind == HandleKind::cuBLAS) {
-        cublasGemmEx(h.cublas, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
-                     alpha, A, CUDA_R_LOW, lda, B, CUDA_R_LOW, ldb,
-                     beta, C, CUDA_R_HIGH, ldc,
-                     COMP_TYPE, CUBLAS_GEMM_DEFAULT);
+        GEMMul8_CUBLAS_GEMM(
+            h.cublas, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
+            alpha, A, CUDA_R_LOW, lda, B, CUDA_R_LOW, ldb,
+            beta, C, CUDA_R_HIGH, ldc,
+            COMP_TYPE, GEMMul8_GEMM_ALGO);
         return;
     }
 
-    update_lt_layouts(h, m, n, k, lda, ldb, ldc, 1, 0, 0, 0);
     auto &plan = get_or_create_plan<BACKEND>(
         h, m, n, k, 1, lda, ldb, ldc, 0, 0, 0, LtBatchKind::None);
 
-    const size_t ws = std::min(h.workspaceSizeInBytes, plan.ws);
-
-    cublasLtMatmul(h.cublasLt, h.opDesc,
-                   alpha, A, h.Adesc, B, h.Bdesc,
-                   beta, C, h.Cdesc, C, h.Cdesc,
-                   &plan.heur.algo, h.workspace, ws, stream);
+    launch_lt_plan<BACKEND>(stream, h, plan, alpha, A, B, beta, C, C);
 }
 
 template <Backend BACKEND>
-inline void call_gemm_tn_strided_batched(
+inline void call_gemm_tn(
+    const cudaStream_t stream, Handle_t &h,
+    int m, int n, int k,
+    const void *alpha,
+    const void *A, size_t lda,
+    const void *B, size_t ldb,
+    const void *beta,
+    void *C, size_t ldc //
+) {
+    if (!h.matprod_k_blocking || k <= h.matprod_k_block_first) {
+        call_gemm_tn_raw<BACKEND>(
+            stream, h,
+            m, n, k,
+            alpha, A, lda,
+            B, ldb,
+            beta, C, ldc);
+        return;
+    }
+
+    using LowT = low_t<BACKEND>;
+    using HiT  = hi_t<BACKEND>;
+
+    constexpr HiT one = HiT(1);
+
+    const LowT *A0 = reinterpret_cast<const LowT *>(A);
+    const LowT *B0 = reinterpret_cast<const LowT *>(B);
+    HiT *C0        = reinterpret_cast<HiT *>(C);
+
+    const int KB0 = h.matprod_k_block_first;
+    const int KB  = h.matprod_k_block_next;
+
+    int k0 = 0;
+    {
+        const int kk = std::min(KB0, k);
+
+        call_gemm_tn_raw<BACKEND>(
+            stream, h,
+            m, n, kk,
+            alpha,
+            A0, lda,
+            B0, ldb,
+            beta,
+            C0, ldc);
+
+        k0 = kk;
+    }
+
+    while (k0 < k) {
+        mod::mod_reduce_matprod<BACKEND>(stream, C0, m, n, ldc, h.modulus_idx, h.modulus_complex);
+
+        const int kk = std::min(KB, k - k0);
+
+        call_gemm_tn_raw<BACKEND>(
+            stream, h,
+            m, n, kk,
+            alpha,
+            A0 + k0, lda,
+            B0 + k0, ldb,
+            &one,
+            C0, ldc);
+
+        k0 += kk;
+    }
+}
+
+template <Backend BACKEND>
+inline void call_gemm_tn_strided_batched_raw(
     const cudaStream_t stream, Handle_t &h,
     int m, int n, int k, int batchCount,
     const void *alpha,
@@ -51,28 +134,140 @@ inline void call_gemm_tn_strided_batched(
     constexpr auto CUDA_R_HIGH = (BACKEND == Backend::INT8) ? CUDA_R_32I : CUDA_R_32F;
     constexpr auto COMP_TYPE   = (BACKEND == Backend::INT8) ? CUBLAS_COMPUTE_32I : CUBLAS_COMPUTE_32F;
 
+    // ROCm's strided-batched GEMM truncates batch strides to 32 bits (seen with ROCm 7.2.3, rocBLAS and hipBLASLt
+    // back ends alike): once a stride reaches 2^32 elements, every batch after the first is written to the wrong
+    // place and the call still returns success. Issue such batches one at a time with host-side 64-bit offsets.
+    if constexpr (isHIP) {
+        constexpr int64_t stride_limit = int64_t(1) << 32;
+        if (batchCount > 1 && (strideA >= stride_limit || strideB >= stride_limit || strideC >= stride_limit)) {
+            const auto *a = static_cast<const low_t<BACKEND> *>(A);
+            const auto *b = static_cast<const low_t<BACKEND> *>(B);
+            auto *c       = static_cast<hi_t<BACKEND> *>(C);
+            for (int i = 0; i < batchCount; ++i) {
+                call_gemm_tn_raw<BACKEND>(stream, h, m, n, k, alpha,
+                                          a + int64_t(i) * strideA, lda, b + int64_t(i) * strideB, ldb,
+                                          beta, c + int64_t(i) * strideC, ldc);
+            }
+            return;
+        }
+    }
+
     if (h.kind == HandleKind::cuBLAS) {
         cublasGemmStridedBatchedEx(h.cublas, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k,
                                    alpha, A, CUDA_R_LOW, lda, strideA, B, CUDA_R_LOW, ldb, strideB,
                                    beta, C, CUDA_R_HIGH, ldc, strideC,
-                                   batchCount, COMP_TYPE, CUBLAS_GEMM_DEFAULT);
+                                   batchCount, COMP_TYPE, GEMMul8_GEMM_ALGO);
         return;
     }
 
-    update_lt_layouts(h, m, n, k, lda, ldb, ldc, batchCount, strideA, strideB, strideC);
     auto &plan = get_or_create_plan<BACKEND>(
         h, m, n, k, batchCount, lda, ldb, ldc, strideA, strideB, strideC, LtBatchKind::Strided);
 
-    const size_t ws = std::min(h.workspaceSizeInBytes, plan.ws);
-
-    cublasLtMatmul(h.cublasLt, h.opDesc,
-                   alpha, A, h.Adesc, B, h.Bdesc,
-                   beta, C, h.Cdesc, C, h.Cdesc,
-                   &plan.heur.algo, h.workspace, ws, stream);
+    if (!plan.valid) {
+        const auto *a = static_cast<const low_t<BACKEND> *>(A);
+        const auto *b = static_cast<const low_t<BACKEND> *>(B);
+        auto *c       = static_cast<hi_t<BACKEND> *>(C);
+        for (int i = 0; i < batchCount; ++i) {
+            call_gemm_tn_raw<BACKEND>(stream, h, m, n, k, alpha,
+                                      a + int64_t(i) * strideA, lda, b + int64_t(i) * strideB, ldb,
+                                      beta, c + int64_t(i) * strideC, ldc);
+        }
+        return;
+    }
+    launch_lt_plan<BACKEND>(stream, h, plan, alpha, A, B, beta, C, C);
 }
 
 template <Backend BACKEND>
-inline void call_gemm_tn_pointer_batched(
+inline void call_gemm_tn_strided_batched(
+    const cudaStream_t stream, Handle_t &h,
+    int m, int n, int k, int batchCount,
+    const void *alpha,
+    const void *A, size_t lda, int64_t strideA,
+    const void *B, size_t ldb, int64_t strideB,
+    const void *beta,
+    void *C, size_t ldc, int64_t strideC //
+) {
+    if (!h.matprod_k_blocking || k <= h.matprod_k_block_first) {
+        call_gemm_tn_strided_batched_raw<BACKEND>(
+            stream, h,
+            m, n, k, batchCount,
+            alpha,
+            A, lda, strideA,
+            B, ldb, strideB,
+            beta,
+            C, ldc, strideC);
+        return;
+    }
+
+    using LowT = low_t<BACKEND>;
+    using HiT  = hi_t<BACKEND>;
+
+    constexpr HiT one = HiT(1);
+
+    const LowT *A0 = reinterpret_cast<const LowT *>(A);
+    const LowT *B0 = reinterpret_cast<const LowT *>(B);
+    HiT *C0        = reinterpret_cast<HiT *>(C);
+
+    const int KB0 = h.matprod_k_block_first;
+    const int KB  = h.matprod_k_block_next;
+    fp8_plan::k_accumulation accumulation;
+    if constexpr (BACKEND == Backend::FP8) {
+        if (h.matprod_fp8_planes) {
+            accumulation = fp8_plan::k_accumulation(
+                int32_t(h.modulus_idx - 20U),
+                unsigned(std::min(KB0, k)));
+        }
+    }
+
+    int k0 = 0;
+    {
+        const int kk = std::min(KB0, k);
+
+        call_gemm_tn_strided_batched_raw<BACKEND>(
+            stream, h,
+            m, n, kk, batchCount,
+            alpha,
+            A0 + k0, lda, strideA,
+            B0 + k0, ldb, strideB,
+            beta,
+            C0, ldc, strideC);
+
+        k0 = kk;
+    }
+
+    while (k0 < k) {
+        const int kk = std::min(KB, k - k0);
+        if constexpr (BACKEND == Backend::FP8) {
+            if (h.matprod_fp8_planes) {
+                mod::mod_reduce_matprod_fp8_batch<BACKEND>(
+                    stream, C0, m, n, ldc, strideC, batchCount,
+                    h.modulus_idx - 20U, accumulation.advance(unsigned(kk)));
+            } else {
+                mod::mod_reduce_matprod_strided<BACKEND>(
+                    stream, C0, m, n, ldc, strideC, batchCount,
+                    h.modulus_idx, h.modulus_complex);
+            }
+        } else {
+            mod::mod_reduce_matprod_strided<BACKEND>(
+                stream, C0, m, n, ldc, strideC, batchCount,
+                h.modulus_idx, h.modulus_complex);
+        }
+
+        call_gemm_tn_strided_batched_raw<BACKEND>(
+            stream, h,
+            m, n, kk, batchCount,
+            alpha,
+            A0 + k0, lda, strideA,
+            B0 + k0, ldb, strideB,
+            &one,
+            C0, ldc, strideC);
+
+        k0 += kk;
+    }
+}
+
+template <Backend BACKEND>
+inline void call_gemm_tn_pointer_batched_raw(
     const cudaStream_t stream, Handle_t &h,
     int m, int n, int k, int batchCount,
     const void *alpha,
@@ -96,21 +291,99 @@ inline void call_gemm_tn_pointer_batched(
                             reinterpret_cast<void *const *>(Carray), CUDA_R_HIGH, ldc,
                             batchCount,
                             COMP_TYPE,
-                            CUBLAS_GEMM_DEFAULT);
+                            GEMMul8_GEMM_ALGO);
         return;
     }
 
-    update_lt_layouts_pointer_array(h, m, n, k, lda, ldb, ldc, batchCount);
     auto &plan = get_or_create_plan<BACKEND>(
         h, m, n, k, batchCount, lda, ldb, ldc, 0, 0, 0, LtBatchKind::PointerArray);
 
-    const size_t ws = std::min(h.workspaceSizeInBytes, plan.ws);
-
-    cublasLtMatmul(h.cublasLt, h.opDesc,
-                   alpha, Aarray, h.Adesc, Barray, h.Bdesc,
-                   beta, Carray, h.Cdesc, Carray, h.Cdesc,
-                   &plan.heur.algo, h.workspace, ws, stream);
+    launch_lt_plan<BACKEND>(stream, h, plan, alpha, Aarray, Barray, beta, Carray, Carray);
 #endif
+}
+
+template <Backend BACKEND>
+inline void call_gemm_tn_pointer_batched(
+    const cudaStream_t stream, Handle_t &h,
+    int m, int n, int k, int batchCount,
+    const void *alpha,
+    void **Aarray, size_t lda,
+    void **Barray, size_t ldb,
+    const void *beta,
+    void **Carray, size_t ldc //
+) {
+    if (!h.matprod_k_blocking || k <= h.matprod_k_block_first) {
+        call_gemm_tn_pointer_batched_raw<BACKEND>(
+            stream, h,
+            m, n, k, batchCount,
+            alpha,
+            Aarray, lda,
+            Barray, ldb,
+            beta,
+            Carray, ldc);
+        return;
+    }
+
+    using HiT = hi_t<BACKEND>;
+
+    constexpr HiT one = HiT(1);
+
+    const int KB0 = h.matprod_k_block_first;
+    const int KB  = h.matprod_k_block_next;
+    fp8_plan::k_accumulation accumulation;
+    if constexpr (BACKEND == Backend::FP8) {
+        if (h.matprod_fp8_planes) {
+            accumulation = fp8_plan::k_accumulation(
+                int32_t(h.modulus_idx - 20U),
+                unsigned(std::min(KB0, k)));
+        }
+    }
+
+    int k0 = 0;
+    int kk = std::min(KB0, k);
+    {
+        call_gemm_tn_pointer_batched_raw<BACKEND>(
+            stream, h,
+            m, n, kk, batchCount,
+            alpha,
+            Aarray, lda,
+            Barray, ldb,
+            beta,
+            Carray, ldc);
+
+        k0 = kk;
+    }
+
+    while (k0 < k) {
+        const int k_advance = kk;
+        kk                  = std::min(KB, k - k0);
+        if constexpr (BACKEND == Backend::FP8) {
+            if (h.matprod_fp8_planes) {
+                mod::mod_reduce_matprod_fp8_pointer_batch<BACKEND>(
+                    stream, Aarray, Barray, Carray, m, n, ldc, batchCount,
+                    k_advance, h.modulus_idx - 20U, accumulation.advance(unsigned(kk)));
+            } else {
+                mod::mod_reduce_matprod_pointer_and_advance<BACKEND>(
+                    stream, Aarray, Barray, Carray, m, n, ldc,
+                    batchCount, k_advance, h.modulus_idx, h.modulus_complex);
+            }
+        } else {
+            mod::mod_reduce_matprod_pointer_and_advance<BACKEND>(
+                stream, Aarray, Barray, Carray, m, n, ldc,
+                batchCount, k_advance, h.modulus_idx, h.modulus_complex);
+        }
+
+        call_gemm_tn_pointer_batched_raw<BACKEND>(
+            stream, h,
+            m, n, kk, batchCount,
+            alpha,
+            Aarray, lda,
+            Barray, ldb,
+            &one,
+            Carray, ldc);
+
+        k0 += kk;
+    }
 }
 
 //------------------------------
@@ -1548,7 +1821,7 @@ inline void block_matmul_1(
 
     } else if constexpr (KIND == MatMulKind::AHxA) {
         static_assert(UPLO_C != CUBLAS_FILL_MODE_FULL, "AHxA output requires UPLO_C.");
-        block_ATxB_1<BACKEND, UPLO_C>(stream, handle, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+        call_gemm_tn<BACKEND>(stream, handle, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 
     } else if constexpr (KIND == MatMulKind::TrmmLeft) {
         static_assert(UPLO_A != CUBLAS_FILL_MODE_FULL, "Left TRMM requires effective UPLO_A.");
@@ -1590,7 +1863,9 @@ inline void block_matmul_3(
 
     } else if constexpr (KIND == MatMulKind::AHxA) {
         static_assert(UPLO_C != CUBLAS_FILL_MODE_FULL, "AHxA output requires UPLO_C.");
-        block_ATxB_3<BACKEND, UPLO_C>(stream, handle, n, k, alpha1, alpha2, alpha3, A1, A2, A3, lda, B1, B2, B3, ldb, beta1, beta2, beta3, C1, C2, C3, ldc);
+        call_gemm_tn<BACKEND>(stream, handle, m, n, k, alpha1, A1, lda, B1, ldb, beta1, C1, ldc);
+        call_gemm_tn<BACKEND>(stream, handle, m, n, k, alpha2, A2, lda, B2, ldb, beta2, C2, ldc);
+        call_gemm_tn<BACKEND>(stream, handle, m, n, k, alpha3, A3, lda, B3, ldb, beta3, C3, ldc);
 
     } else if constexpr (KIND == MatMulKind::TrmmLeft) {
         static_assert(UPLO_A != CUBLAS_FILL_MODE_FULL, "Left TRMM requires effective UPLO_A.");
@@ -1632,7 +1907,7 @@ inline void block_matmul_1_strided_batched(
 
     } else if constexpr (KIND == MatMulKind::AHxA) {
         static_assert(UPLO_C != CUBLAS_FILL_MODE_FULL, "AHxA output requires UPLO_C.");
-        block_ATxB_1_strided_batched<BACKEND, UPLO_C>(stream, handle, n, k, batchCount, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC);
+        call_gemm_tn_strided_batched<BACKEND>(stream, handle, m, n, k, batchCount, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC);
 
     } else if constexpr (KIND == MatMulKind::TrmmLeft) {
         static_assert(UPLO_A != CUBLAS_FILL_MODE_FULL, "Left TRMM requires effective UPLO_A.");
@@ -1674,7 +1949,9 @@ inline void block_matmul_3_strided_batched(
 
     } else if constexpr (KIND == MatMulKind::AHxA) {
         static_assert(UPLO_C != CUBLAS_FILL_MODE_FULL, "AHxA output requires UPLO_C.");
-        block_ATxB_3_strided_batched<BACKEND, UPLO_C>(stream, handle, n, k, batchCount, alpha1, alpha2, alpha3, A1, A2, A3, lda, strideA, B1, B2, B3, ldb, strideB, beta1, beta2, beta3, C1, C2, C3, ldc, strideC);
+        call_gemm_tn_strided_batched<BACKEND>(stream, handle, m, n, k, batchCount, alpha1, A1, lda, strideA, B1, ldb, strideB, beta1, C1, ldc, strideC);
+        call_gemm_tn_strided_batched<BACKEND>(stream, handle, m, n, k, batchCount, alpha2, A2, lda, strideA, B2, ldb, strideB, beta2, C2, ldc, strideC);
+        call_gemm_tn_strided_batched<BACKEND>(stream, handle, m, n, k, batchCount, alpha3, A3, lda, strideA, B3, ldb, strideB, beta3, C3, ldc, strideC);
 
     } else if constexpr (KIND == MatMulKind::TrmmLeft) {
         static_assert(UPLO_A != CUBLAS_FILL_MODE_FULL, "Left TRMM requires effective UPLO_A.");

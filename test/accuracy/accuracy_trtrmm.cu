@@ -66,6 +66,7 @@ template <typename T>
 void check_accuracy(
     std::string &deviceName,
     std::string &dateTime,
+    size_t memory_limit,
     cublasFillMode_t uplo_A,
     cublasFillMode_t uplo_B,
     cublasOperation_t trans_A,
@@ -74,7 +75,7 @@ void check_accuracy(
     cublasDiagType_t diag_B,
     const bool run_Ozaki2_I8,
     const bool run_Ozaki2_F8,
-    const bool run_Ozaki1_I8 //
+    const bool run_cuBLAS_FP64_emu //
 ) {
     if (uplo_A != CUBLAS_FILL_MODE_UPPER && uplo_A != CUBLAS_FILL_MODE_LOWER) {
         assert(false && "TRTRMM requires uplo_A = UPPER or LOWER.");
@@ -105,6 +106,7 @@ void check_accuracy(
                            trans_tag(trans_A) +
                            trans_tag(trans_B) +
                            std::string("nonunit_") +
+                           memTag(memory_limit) +
                            deviceName + "_" + dateTime + ".csv";
 
     std::ofstream outFile(fileName);
@@ -159,7 +161,7 @@ void check_accuracy(
 
     bool run_oz2_i8 = run_Ozaki2_I8;
     bool run_oz2_f8 = run_Ozaki2_F8;
-    bool run_oz1_i8 = run_Ozaki1_I8 && use_ozaki1;
+    bool run_oz1_i8 = run_cuBLAS_FP64_emu && use_ozaki1;
 
     std::vector<size_t> K_list;
     for (auto &n : N_list) {
@@ -175,31 +177,25 @@ void check_accuracy(
 
     const size_t lwork_blas = size_t(32) << 20;
 
-    const size_t lwork_gemmul8_i8 =
-        (run_oz2_i8)
-            ? gemmul8::workSize<testTraits<T>::is_complex,
-                                gemmul8::Backend::INT8,
-                                func>(
-                  n_max, n_max, n_max, num_moduli_max)
-            : 0;
-
-    const size_t lwork_gemmul8_f8 =
-        (run_oz2_f8)
-            ? gemmul8::workSize<testTraits<T>::is_complex,
-                                gemmul8::Backend::FP8,
-                                func>(
-                  n_max, n_max, n_max, num_moduli_max)
-            : 0;
-
-    const size_t lwork_ozaki1 =
-        (run_oz1_i8)
-            ? ozaki1::workSize(n_max, n_max, n_max, 1,
-                               testTraits<T>::is_complex,
-                               8 * num_slice_max - 1)
-            : 0;
-
-    const size_t lwork_emu =
-        std::max(std::max(lwork_gemmul8_i8, lwork_gemmul8_f8), lwork_ozaki1);
+    if (memory_limit > 0) {
+        gemmul8::set_memory_saving(handle, true);
+        gemmul8::set_max_worksize(handle, memory_limit);
+        gemmul8::set_memory_savingLt(handleLt, true);
+        gemmul8::set_max_worksizeLt(handleLt, memory_limit);
+    }
+    size_t lwork_gemmul8_i8_ = 0;
+    size_t lwork_gemmul8_f8_ = 0;
+#if GEMMUL8_BUILD_INT8
+    lwork_gemmul8_i8_ = gemmul8::workSize<testTraits<T>::is_complex, gemmul8::Backend::INT8, func>(n_max, n_max, n_max, num_moduli_max);
+#endif
+#if GEMMUL8_BUILD_FP8
+    lwork_gemmul8_f8_ = gemmul8::workSize<testTraits<T>::is_complex, gemmul8::Backend::FP8, func>(n_max, n_max, n_max, num_moduli_max);
+#endif
+    const size_t lwork_ozaki1_     = ozaki1::workSize(n_max, n_max, n_max, 1, testTraits<T>::is_complex, 8 * num_slice_max - 1);
+    const size_t lwork_gemmul8_i8  = (run_oz2_i8) ? std::max(memory_limit, lwork_gemmul8_i8_) : 0;
+    const size_t lwork_gemmul8_f8  = (run_oz2_f8) ? std::max(memory_limit, lwork_gemmul8_f8_) : 0;
+    const size_t lwork_ozaki1      = (run_oz1_i8) ? lwork_ozaki1_ : 0;
+    const size_t lwork_emu         = std::max(std::max(lwork_gemmul8_i8, lwork_gemmul8_f8), lwork_ozaki1);
 
     CHECK_CUDA(cudaMallocAsync(reinterpret_cast<void **>(&A), size_A * sizeof(T), stream));
     CHECK_CUDA(cudaMallocAsync(reinterpret_cast<void **>(&B), size_B * sizeof(T), stream));
@@ -297,7 +293,7 @@ void check_accuracy(
                     const std::string funcname =
                         std::to_string(phi) + "," +
                         std::to_string(n) + "," +
-                        std::string("OS1-") + std::to_string(num_slice) + ",";
+                        std::string("cublas_FP64emu-") + std::to_string(mantissaBitCount) + ",";
 
                     PRINT_nobreak(outFile, funcname);
 
@@ -372,6 +368,7 @@ void check_accuracy(
             }
 #endif
 
+#if GEMMUL8_BUILD_INT8
             //-------------------------------
             // fast mode int8
             //-------------------------------
@@ -459,7 +456,9 @@ void check_accuracy(
                 PRINT(outFile, "");
                 CHECK_CUDA(cudaStreamSynchronize(stream));
             }
+#endif
 
+#if GEMMUL8_BUILD_FP8
             //-------------------------------
             // fast mode fp8
             //-------------------------------
@@ -549,12 +548,18 @@ void check_accuracy(
                 PRINT(outFile, "");
                 CHECK_CUDA(cudaStreamSynchronize(stream));
             }
+#endif
         }
     }
 
     std::cout << std::endl;
 
     CHECK_CUDA(cudaStreamSynchronize(stream));
+
+    if (memory_limit > 0) {
+        gemmul8::clear_config(handle);
+        gemmul8::clear_configLt(handleLt);
+    }
 
     CHECK_CUDA(cudaFreeAsync(work_blas, stream));
     CHECK_CUDA(cudaFreeAsync(work_emu, stream));
@@ -574,22 +579,22 @@ void check_accuracy(
 }
 
 template void check_accuracy<float>(
-    std::string &, std::string &, cublasFillMode_t, cublasFillMode_t,
+    std::string &, std::string &, size_t, cublasFillMode_t, cublasFillMode_t,
     cublasOperation_t, cublasOperation_t, cublasDiagType_t, cublasDiagType_t,
     const bool, const bool, const bool);
 
 template void check_accuracy<double>(
-    std::string &, std::string &, cublasFillMode_t, cublasFillMode_t,
+    std::string &, std::string &, size_t, cublasFillMode_t, cublasFillMode_t,
     cublasOperation_t, cublasOperation_t, cublasDiagType_t, cublasDiagType_t,
     const bool, const bool, const bool);
 
 template void check_accuracy<cuFloatComplex>(
-    std::string &, std::string &, cublasFillMode_t, cublasFillMode_t,
+    std::string &, std::string &, size_t, cublasFillMode_t, cublasFillMode_t,
     cublasOperation_t, cublasOperation_t, cublasDiagType_t, cublasDiagType_t,
     const bool, const bool, const bool);
 
 template void check_accuracy<cuDoubleComplex>(
-    std::string &, std::string &, cublasFillMode_t, cublasFillMode_t,
+    std::string &, std::string &, size_t, cublasFillMode_t, cublasFillMode_t,
     cublasOperation_t, cublasOperation_t, cublasDiagType_t, cublasDiagType_t,
     const bool, const bool, const bool);
 

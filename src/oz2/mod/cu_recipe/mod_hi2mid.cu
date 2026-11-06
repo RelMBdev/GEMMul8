@@ -23,9 +23,10 @@ inline constexpr cublasFillMode_t UPLO = GEMMUL8_INST_FILLMODE;
 
 template void mod_hi2mid<BE, COMPLEX, UPLO>(
     const cudaStream_t,
-    const unsigned, 
+    const unsigned,
     const size_t, const unsigned,
     common::matptr_t<common::hi_t<BE>, COMPLEX> &,
-    common::mid_t<BE, COMPLEX> *);
+    common::mid_t<BE, COMPLEX> *,
+    const unsigned);
 
 } // namespace gemmul8::mod

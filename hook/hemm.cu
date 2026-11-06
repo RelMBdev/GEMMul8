@@ -197,6 +197,7 @@ static inline cublasStatus_t call_gemmul8_hemm(
     cudaStream_t stream //
 ) {
     if (backend == gemmul8::Backend::INT8) {
+#if GEMMUL8_BUILD_INT8
 
         (void)gemmul8::hemm<T, gemmul8::Backend::INT8>(
             handle,
@@ -213,7 +214,11 @@ static inline cublasStatus_t call_gemmul8_hemm(
             skip_A, skip_B);
 
         return CUBLAS_STATUS_SUCCESS;
+#else
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+#endif
     }
+#if GEMMUL8_BUILD_FP8
 
     cublasLtHandle_t lt  = nullptr;
     cublasStatus_t st_lt = gemmul8::hook::ensure_lt_handle_locked(hst, &lt);
@@ -235,6 +240,9 @@ static inline cublasStatus_t call_gemmul8_hemm(
         stream);
 
     return CUBLAS_STATUS_SUCCESS;
+#else
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+#endif
 }
 
 template <typename T>
@@ -244,7 +252,8 @@ static inline size_t call_gemmul8_hemm_workSize(
     int64_t m, int64_t n,
     int num_moduli,
     bool enable_skip_A, bool enable_skip_B,
-    size_t *wA, size_t *wB //
+    size_t *wA, size_t *wB,
+    bool fastmode //
 ) {
     constexpr bool COMPLEX       = HemmTraits<T>::isComplex;
     constexpr gemmul8::Func FUNC = gemmul8::Func::hemm;
@@ -254,15 +263,23 @@ static inline size_t call_gemmul8_hemm_workSize(
     const size_t kk = static_cast<size_t>((side == CUBLAS_SIDE_LEFT) ? m : n);
 
     if (backend == gemmul8::Backend::INT8) {
+#if GEMMUL8_BUILD_INT8
         constexpr gemmul8::Backend BACKEND = gemmul8::Backend::INT8;
         return gemmul8::workSize<COMPLEX, BACKEND, FUNC>(
             mm, nn, kk,
-            num_moduli, enable_skip_A, enable_skip_B, wA, wB);
+            num_moduli, enable_skip_A, enable_skip_B, wA, wB, fastmode);
+#else
+        return 0;
+#endif
     } else {
+#if GEMMUL8_BUILD_FP8
         constexpr gemmul8::Backend BACKEND = gemmul8::Backend::FP8;
         return gemmul8::workSize<COMPLEX, BACKEND, FUNC>(
             mm, nn, kk,
-            num_moduli, enable_skip_A, enable_skip_B, wA, wB);
+            num_moduli, enable_skip_A, enable_skip_B, wA, wB, fastmode);
+#else
+        return 0;
+#endif
     }
 }
 
@@ -305,6 +322,8 @@ static inline cublasStatus_t run_gemmul8_hemm_emulation(const HemmArgs<T> &a, co
     cublasStatus_t st_ord = gemmul8::hook::ensure_stream_ordered_locked(*sp, stream);
     if (st_ord != CUBLAS_STATUS_SUCCESS) return st_ord;
 
+    const auto ws_config = gemmul8::hook::workspace_config(a.handle, env.enable_skipA, env.enable_skipB);
+
     size_t wsizeA      = 0;
     size_t wsizeB      = 0;
     const size_t wsize = call_gemmul8_hemm_workSize<T>(
@@ -312,40 +331,33 @@ static inline cublasStatus_t run_gemmul8_hemm_emulation(const HemmArgs<T> &a, co
         a.side,
         a.m, a.n,
         env.num_moduli,
-        env.enable_skipA,
-        env.enable_skipB,
-        &wsizeA, &wsizeB);
+        ws_config.enable_skipA,
+        ws_config.enable_skipB,
+        &wsizeA, &wsizeB,
+        env.fastmode);
 
     if (wsize < wsizeA + wsizeB) return CUBLAS_STATUS_INVALID_VALUE;
 
-    const size_t needA = wsizeA;
-    const size_t needB = wsizeB;
-    const size_t needC = wsize - needA - needB;
+    const auto request = gemmul8::hook::workspace_request(ws_config, wsize, wsizeA, wsizeB);
 
-    size_t reqA = needA;
-    size_t reqB = needB;
-    size_t reqC = needC;
+    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
 
-    const bool enforce_maxws = env.enable_skipA || env.enable_skipB;
-    if (enforce_maxws) {
-        if (env.enable_skipA) reqA = std::max(reqA, gemmul8::hook::max_workSizeA);
-        if (env.enable_skipB) reqB = std::max(reqB, gemmul8::hook::max_workSizeB);
-        reqC = std::max(reqC, gemmul8::hook::max_workSizeC);
+    if (ws_config.memory_saving) {
+        st = gemmul8::hook::prepare_memory_saving_workspaces_locked(*sp, request, ws_config.limit, stream);
+        if (st != CUBLAS_STATUS_SUCCESS) return st;
     }
 
     void *workA_raw = nullptr;
     void *workB_raw = nullptr;
     void *workC_raw = nullptr;
 
-    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
-
-    st = gemmul8::hook::get_work_locked(*sp, sp->workA, sp->workA_size, reqA, &workA_raw, "workA", stream);
+    st = gemmul8::hook::get_work_locked(*sp, sp->workA, sp->workA_size, request.workA, &workA_raw, "workA", stream);
     if (st != CUBLAS_STATUS_SUCCESS) return st;
 
-    st = gemmul8::hook::get_work_locked(*sp, sp->workB, sp->workB_size, reqB, &workB_raw, "workB", stream);
+    st = gemmul8::hook::get_work_locked(*sp, sp->workB, sp->workB_size, request.workB, &workB_raw, "workB", stream);
     if (st != CUBLAS_STATUS_SUCCESS) return st;
 
-    st = gemmul8::hook::get_work_locked(*sp, sp->workC, sp->workC_size, reqC, &workC_raw, "workC", stream);
+    st = gemmul8::hook::get_work_locked(*sp, sp->workC, sp->workC_size, request.workC, &workC_raw, "workC", stream);
     if (st != CUBLAS_STATUS_SUCCESS) return st;
 
     int8_t *workA = reinterpret_cast<int8_t *>(workA_raw);
@@ -362,8 +374,8 @@ static inline cublasStatus_t run_gemmul8_hemm_emulation(const HemmArgs<T> &a, co
         a.B, a.m, a.n, a.ldb,
         env.num_moduli, env.fastmode, env.backend);
 
-    const bool skipA = gemmul8::hook::can_skip_scaled_operand_locked(*sp, keyA, workA, env.enable_skipA);
-    const bool skipB = gemmul8::hook::can_skip_scaled_operand_locked(*sp, keyB, workB, env.enable_skipB);
+    const bool skipA = gemmul8::hook::can_skip_scaled_operand_locked(*sp, keyA, workA, ws_config.enable_skipA);
+    const bool skipB = gemmul8::hook::can_skip_scaled_operand_locked(*sp, keyB, workB, ws_config.enable_skipB);
 
     st = call_gemmul8_hemm<T>(
         env.backend,
@@ -377,7 +389,7 @@ static inline cublasStatus_t run_gemmul8_hemm_emulation(const HemmArgs<T> &a, co
         reinterpret_cast<void *>(workC),
         reinterpret_cast<void *>(workA),
         reinterpret_cast<void *>(workB),
-        env.enable_skipA, env.enable_skipB,
+        ws_config.enable_skipA, ws_config.enable_skipB,
         skipA, skipB,
         stream);
 
@@ -409,6 +421,7 @@ static inline cublasStatus_t hemm_common_impl(
     HookHemmEnv env{};
     HemmTraits<T>::get_env(OP, env.num_moduli, env.fastmode, env.enable_skipA, env.enable_skipB);
     env.backend = gemmul8::hook::requested_backend(OP);
+    if (!gemmul8::hook::backend_is_built(env.backend)) return call_native();
 
     constexpr int num_moduli_min = 2;
     constexpr int num_moduli_max = gemmul8::hook::num_moduli_threshold<T>;

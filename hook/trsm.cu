@@ -135,6 +135,7 @@ static inline cublasStatus_t call_gemmul8_trsm(
     cudaStream_t stream //
 ) {
     if (backend == gemmul8::Backend::INT8) {
+#if GEMMUL8_BUILD_INT8
 
         (void)gemmul8::trsm<T, gemmul8::Backend::INT8>(
             handle,
@@ -147,7 +148,11 @@ static inline cublasStatus_t call_gemmul8_trsm(
             work);
 
         return CUBLAS_STATUS_SUCCESS;
+#else
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+#endif
     }
+#if GEMMUL8_BUILD_FP8
 
     cublasLtHandle_t lt  = nullptr;
     cublasStatus_t st_lt = gemmul8::hook::ensure_lt_handle_locked(hst, &lt);
@@ -165,11 +170,16 @@ static inline cublasStatus_t call_gemmul8_trsm(
         stream);
 
     return CUBLAS_STATUS_SUCCESS;
+#else
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+#endif
 }
 
 template <typename T>
 static inline size_t call_gemmul8_trsm_workSize(
     gemmul8::Backend backend,
+    cublasHandle_t handle,
+    cublasLtHandle_t lt,
     cublasSideMode_t side,
     int64_t m, int64_t n,
     int num_moduli //
@@ -178,11 +188,19 @@ static inline size_t call_gemmul8_trsm_workSize(
     const size_t nn = static_cast<size_t>(n);
 
     if (backend == gemmul8::Backend::INT8) {
+#if GEMMUL8_BUILD_INT8
         constexpr gemmul8::Backend BACKEND = gemmul8::Backend::INT8;
-        return gemmul8::workSizeTrsm<T, BACKEND>(side, mm, nn, num_moduli);
+        return gemmul8::workSizeTrsm<T, BACKEND>(handle, side, mm, nn, num_moduli);
+#else
+        return 0;
+#endif
     } else {
+#if GEMMUL8_BUILD_FP8
         constexpr gemmul8::Backend BACKEND = gemmul8::Backend::FP8;
-        return gemmul8::workSizeTrsm<T, BACKEND>(side, mm, nn, num_moduli);
+        return gemmul8::workSizeTrsmLt<T, BACKEND>(lt, side, mm, nn, num_moduli);
+#else
+        return 0;
+#endif
     }
 }
 
@@ -222,21 +240,39 @@ static inline cublasStatus_t run_gemmul8_trsm_emulation(const TrsmArgs<T> &a, co
     cublasStatus_t st_ord = gemmul8::hook::ensure_stream_ordered_locked(*sp, stream);
     if (st_ord != CUBLAS_STATUS_SUCCESS) return st_ord;
 
+    cublasLtHandle_t lt = nullptr;
+    if (env.backend == gemmul8::Backend::FP8) {
+        const cublasStatus_t st_lt = gemmul8::hook::ensure_lt_handle_locked(*sp, &lt);
+        if (st_lt != CUBLAS_STATUS_SUCCESS) return st_lt;
+    }
+
     const size_t need = call_gemmul8_trsm_workSize<T>(
         env.backend,
+        a.handle, lt,
         a.side,
         a.m, a.n,
         env.num_moduli);
 
-    const size_t req = std::max(need, gemmul8::hook::max_workSizeC);
+    const auto ws_config = gemmul8::hook::workspace_config(a.handle, false, false);
+    auto request         = gemmul8::hook::workspace_request(ws_config, need, 0, 0);
+
+    if (!ws_config.memory_saving_mode) {
+        request.workC = std::max(request.workC, gemmul8::hook::max_workSizeC);
+    }
+
+    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+    if (ws_config.memory_saving) {
+        st = gemmul8::hook::prepare_memory_saving_workspaces_locked(*sp, request, ws_config.limit, stream);
+        if (st != CUBLAS_STATUS_SUCCESS) return st;
+    }
 
     void *work_raw = nullptr;
 
-    cublasStatus_t st = gemmul8::hook::get_work_locked(
+    st = gemmul8::hook::get_work_locked(
         *sp,
         sp->workC,
         sp->workC_size,
-        req,
+        request.workC,
         &work_raw,
         "workC",
         stream);
@@ -284,6 +320,7 @@ static inline cublasStatus_t trsm_common_impl(
     env.num_moduli = dummy_num_moduli;
     env.fastmode   = dummy_fastmode;
     env.backend    = gemmul8::hook::requested_backend(OP);
+    if (!gemmul8::hook::backend_is_built(env.backend)) return call_native();
 
     constexpr int num_moduli_min = 2;
     constexpr int num_moduli_max = gemmul8::hook::num_moduli_threshold<T>;
@@ -296,6 +333,8 @@ static inline cublasStatus_t trsm_common_impl(
         handle, side, uplo, trans, diag, m, n,
         alpha, A, lda, B, ldb);
     if (st_param != CUBLAS_STATUS_SUCCESS) return st_param;
+
+    gemmul8::hook::apply_block_size_trsm_environment(handle);
 
     TrsmArgs<T> args{};
     args.handle = handle;

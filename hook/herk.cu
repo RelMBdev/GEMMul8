@@ -165,6 +165,7 @@ static inline cublasStatus_t call_gemmul8_herk(
     cudaStream_t stream //
 ) {
     if (backend == gemmul8::Backend::INT8) {
+#if GEMMUL8_BUILD_INT8
 
         (void)gemmul8::herk<T, gemmul8::Backend::INT8, T>(
             handle,
@@ -179,7 +180,11 @@ static inline cublasStatus_t call_gemmul8_herk(
             enable_skip_A, skip_A);
 
         return CUBLAS_STATUS_SUCCESS;
+#else
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+#endif
     }
+#if GEMMUL8_BUILD_FP8
 
     cublasLtHandle_t lt  = nullptr;
     cublasStatus_t st_lt = gemmul8::hook::ensure_lt_handle_locked(hst, &lt);
@@ -199,6 +204,9 @@ static inline cublasStatus_t call_gemmul8_herk(
         stream);
 
     return CUBLAS_STATUS_SUCCESS;
+#else
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+#endif
 }
 
 template <typename T>
@@ -207,22 +215,31 @@ static inline size_t call_gemmul8_herk_workSize(
     int64_t n, int64_t k,
     int num_moduli,
     bool enable_skip_A,
-    size_t *wA //
+    size_t *wA,
+    bool fastmode //
 ) {
     constexpr bool COMPLEX       = true;
     constexpr gemmul8::Func FUNC = gemmul8::Func::herk;
 
     size_t wB = 0;
     if (backend == gemmul8::Backend::INT8) {
+#if GEMMUL8_BUILD_INT8
         constexpr gemmul8::Backend BACKEND = gemmul8::Backend::INT8;
         return gemmul8::workSize<COMPLEX, BACKEND, FUNC>(
             static_cast<size_t>(n), static_cast<size_t>(n), static_cast<size_t>(k),
-            num_moduli, enable_skip_A, false, wA, &wB);
+            num_moduli, enable_skip_A, false, wA, &wB, fastmode);
+#else
+        return 0;
+#endif
     } else {
+#if GEMMUL8_BUILD_FP8
         constexpr gemmul8::Backend BACKEND = gemmul8::Backend::FP8;
         return gemmul8::workSize<COMPLEX, BACKEND, FUNC>(
             static_cast<size_t>(n), static_cast<size_t>(n), static_cast<size_t>(k),
-            num_moduli, enable_skip_A, false, wA, &wB);
+            num_moduli, enable_skip_A, false, wA, &wB, fastmode);
+#else
+        return 0;
+#endif
     }
 }
 
@@ -262,36 +279,35 @@ static inline cublasStatus_t run_gemmul8_herk_emulation(const HerkArgs<T> &a, co
     cublasStatus_t st_ord = gemmul8::hook::ensure_stream_ordered_locked(*sp, stream);
     if (st_ord != CUBLAS_STATUS_SUCCESS) return st_ord;
 
+    const auto ws_config = gemmul8::hook::workspace_config(a.handle, env.enable_skipA, false);
+
     size_t wsizeA      = 0;
     const size_t wsize = call_gemmul8_herk_workSize<T>(
         env.backend,
         a.n, a.k,
         env.num_moduli,
-        env.enable_skipA,
-        &wsizeA);
+        ws_config.enable_skipA,
+        &wsizeA,
+        env.fastmode);
 
     if (wsize < wsizeA) return CUBLAS_STATUS_INVALID_VALUE;
 
-    const size_t needA = wsizeA;
-    const size_t needC = wsize - needA;
+    const auto request = gemmul8::hook::workspace_request(ws_config, wsize, wsizeA, 0);
 
-    size_t reqA = needA;
-    size_t reqC = needC;
+    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
 
-    if (env.enable_skipA) {
-        reqA = std::max(reqA, gemmul8::hook::max_workSizeA);
-        reqC = std::max(reqC, gemmul8::hook::max_workSizeC);
+    if (ws_config.memory_saving) {
+        st = gemmul8::hook::prepare_memory_saving_workspaces_locked(*sp, request, ws_config.limit, stream);
+        if (st != CUBLAS_STATUS_SUCCESS) return st;
     }
 
     void *workA_raw = nullptr;
     void *workC_raw = nullptr;
 
-    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
-
-    st = gemmul8::hook::get_work_locked(*sp, sp->workA, sp->workA_size, reqA, &workA_raw, "workA", stream);
+    st = gemmul8::hook::get_work_locked(*sp, sp->workA, sp->workA_size, request.workA, &workA_raw, "workA", stream);
     if (st != CUBLAS_STATUS_SUCCESS) return st;
 
-    st = gemmul8::hook::get_work_locked(*sp, sp->workC, sp->workC_size, reqC, &workC_raw, "workC", stream);
+    st = gemmul8::hook::get_work_locked(*sp, sp->workC, sp->workC_size, request.workC, &workC_raw, "workC", stream);
     if (st != CUBLAS_STATUS_SUCCESS) return st;
 
     int8_t *workA = reinterpret_cast<int8_t *>(workA_raw);
@@ -301,7 +317,7 @@ static inline cublasStatus_t run_gemmul8_herk_emulation(const HerkArgs<T> &a, co
         a.A, a.n, a.k, a.lda, a.trans,
         env.num_moduli, env.fastmode, env.backend);
 
-    const bool skipA = gemmul8::hook::can_skip_scaled_operand_locked(*sp, keyA, workA, env.enable_skipA);
+    const bool skipA = gemmul8::hook::can_skip_scaled_operand_locked(*sp, keyA, workA, ws_config.enable_skipA);
 
     st = call_gemmul8_herk<T>(
         env.backend,
@@ -314,7 +330,7 @@ static inline cublasStatus_t run_gemmul8_herk_emulation(const HerkArgs<T> &a, co
         env.num_moduli, env.fastmode,
         reinterpret_cast<void *>(workC),
         reinterpret_cast<void *>(workA),
-        env.enable_skipA,
+        ws_config.enable_skipA,
         skipA,
         stream);
 
@@ -343,6 +359,7 @@ static inline cublasStatus_t herk_common_impl(
     bool dummy_skipB = false;
     HerkTraits<T>::get_env(OP, env.num_moduli, env.fastmode, env.enable_skipA, dummy_skipB);
     env.backend = gemmul8::hook::requested_backend(OP);
+    if (!gemmul8::hook::backend_is_built(env.backend)) return call_native();
 
     constexpr int num_moduli_min = 2;
     constexpr int num_moduli_max = gemmul8::hook::num_moduli_threshold<T>;
